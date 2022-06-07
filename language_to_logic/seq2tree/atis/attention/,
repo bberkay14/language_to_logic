@@ -1,0 +1,556 @@
+using Knet, Test, Base.Iterators, Printf, LinearAlgebra, Random,  IterTools, CUDA
+#Knet.atype() = KnetArray{Float32}
+include("/scratch/users/bberkay14/workfolder/language_to_logic/seq2tree/seq2tree/atis/tree.jl")
+include("/scratch/users/bberkay14/workfolder/language_to_logic/seq2tree/seq2tree/atis/util.jl")
+Knet.atype() = KnetArray{Float32}
+using JLD2
+using ArgParse
+using Distributions
+
+struct Memory; w; end
+
+struct Attention; wquery; wattn; scale; end
+
+struct Embed; w; end
+
+
+function Embed(opt, vocabsize::Int, embedsize::Int)
+
+    return Embed(param(rand(Uniform(-opt["init_weight"], opt["init_weight"]),embedsize,vocabsize)))
+end
+
+function (l::Embed)(x)
+    #println(l.w)
+    #println(x)
+    #println(size(x))
+    return l.w[:,x]
+end
+
+struct Linear; w; b; end
+
+
+function Linear(opt, inputsize::Int, outputsize::Int)
+
+    return Linear(param(rand(Uniform(-opt["init_weight"], opt["init_weight"]),outputsize,inputsize)),param0(outputsize))
+end
+
+function (l::Linear)(x)
+
+    return (mmul(l.w , x) .+ l.b)
+end
+
+struct L2L
+    enc_lstm
+    dec_lstm
+    memory
+    attention
+    srcembed
+    tgtembed
+    dropout
+    projection
+end
+
+
+function L2L(src_input_size, tgt_input_size, opt)
+    srcembed = Embed(opt, src_input_size + 2 , opt["rnn_size"])
+    #println("17000000000000000000000")
+    #println("17000000000000000000000")
+    #println(tgt_input_size)
+    #println(opt["rnn_size"])
+    tgtembed = Embed(opt, tgt_input_size + 2 , opt["rnn_size"])
+    enc_lstm = RNN(opt["rnn_size"], opt["rnn_size"]; dropout=0, rnnType=:lstm)
+    #input feeding deneme için aşağıdaki kodu aç
+    #dec_lstm = RNN(opt["rnn_size"], 3*opt["rnn_size"]; dropout=0, rnnType=:lstm)
+    #dec_lstm = RNN(2*opt["rnn_size"], opt["rnn_size"]; dropout=0, rnnType=:lstm)
+    dec_lstm = RNN(2*opt["rnn_size"], opt["rnn_size"]; dropout=0, rnnType=:lstm)
+    memory = Memory(1)
+    attention = Attention(1, param(rand(Uniform(-opt["init_weight"], opt["init_weight"]),opt["rnn_size"],2*opt["rnn_size"])), param(1) )
+    
+    dropout = opt["dropoutrec"]
+    projection = Linear(opt, opt["rnn_size"],  tgt_input_size)
+    return L2L(enc_lstm, dec_lstm, memory, attention, srcembed, tgtembed, dropout, projection)
+end
+
+
+function (m::Memory)(x)
+    #println("BURAA1")
+    
+    values = permutedims(x, [1, 3, 2])
+    #println("BURAA2")
+    keys = mmul(m.w, values)
+    #println("BURAA3")
+    return keys, values
+end
+# You can use the following helper function for scaling and linear transformations of 3-D tensors:
+mmul(w,x) = (w == 1 ? x : w == 0 ? 0 : reshape(w * reshape(x,size(x,1),:), (:, size(x)[2:end]...)))
+
+
+function encode(l::L2L, src, prev_c, prev_h)        
+    l.enc_lstm.h, l.enc_lstm.c = prev_c, prev_h
+    src =  src .+ 1
+    println("SRCCCCCCCCCCCCC")
+    println(src)
+    #src = [x .+ 1 for x in src]
+    #src_embedding = l.srcembed(src)
+    src_embedding = [l.srcembed(x) for x in src]
+    #println(src_embedding)
+    #println(hcat(src_embedding...)[1,2])
+    #println(vcat(src_embedding...))
+    src_embedding = hcat(src_embedding...)
+     
+    src_embedding = dropout(src_embedding,l.dropout; drop=true)
+    #src_embedding = [dropout(x,l.dropout; drop=true) for x in src_embedding ]
+    src_encoded = l.enc_lstm(src_embedding)
+    #println("HHHHHHHHHHHHHH")
+    #println(size(l.enc_lstm.h))
+    #println(l.enc_lstm.h)
+    dec_lstm2 = RNN(200, 200; dropout=0, rnnType=:lstm)
+    decdec =  dec_lstm2(KnetArray{Float32}(randn(Float32,200,20,1)))
+    #println(src_embedding[1])
+    #println(dec_lstm2.h)
+    #println(src_embedding)
+    src_encoded = l.enc_lstm(KnetArray{Float32}(rand(Float32,200,20,1)))
+    #src_encoded = [l.enc_lstm(x) for x in src_embedding]
+    #s.decoder.h = permutedims(reshape(permutedims(src_encoded[:,:,end], (2,1)), (size(src_encoded[:,:,end], 2),Int64(size(src_encoded[:,:,end], 1) /2) ,2)), (2,1,3))
+    l.dec_lstm.h = l.enc_lstm.h
+    #l.dec_lstm.h = 0
+    l.dec_lstm.c = l.enc_lstm.c
+    #l.dec_lstm.c = 0
+    return l.enc_lstm.c, l.enc_lstm.h
+end
+
+function (a::Attention)(cell, mem)
+    query = mmul(a.wquery, cell)
+    keys, vals = mem
+    attention_scores = bmm( permutedims(query, (3,1,2)) , permutedims(keys, (2,3,1)))
+    #attention_scores = bmm( reshape(query, (size(query,3),size(query,1),size(query,2))) , keys)
+    scaled_attention = a.scale .* attention_scores
+    scaled_attention = softmax(scaled_attention; dims=2)
+    context_vector = bmm(permutedims(vals, (2,3,1)), permutedims(scaled_attention, (2,1,3)))
+    
+
+    concatenated_vectors = vcat(cell , permutedims(context_vector, (1,3,2)) )
+
+    final_vector = mmul(a.wattn , concatenated_vectors)
+
+    return final_vector
+end
+
+
+#function decode(l::L2L, tgt, mem, prev, parent_h)
+function decode(l::L2L, tgt,  parent_h)
+    tgt = Int64.(tgt .+ 1)
+    #tgt = tgt
+    #tgt_embedding = l.tgtembed(tgt)
+    println("TTTTTTTTTTTTTTTTT")
+    println(tgt)
+    println(size(tgt))
+    println(parent_h)
+    println(size(parent_h))
+    tgt_embedding = [l.tgtembed(x) for x in tgt]
+    println(tgt_embedding)
+    #input feeding istiyorsan aşağıdaki kodu aç
+    #input = hcat(tgt_embedding, parent_h,prev)
+    #input = hcat(tgt_embedding', parent_h)
+    input = vcat(tgt_embedding'...)
+    println(size(input))
+    input = hcat(input, parent_h)
+    tgt_embedding = tgt_embedding'
+    tgt_embedding = dropout(tgt_embedding, l.dropout; drop=true)
+    #println(permutedims(input, [2,1]))
+    #println(size(permutedims(input, [2,1])))
+    input = reshape(input, (size(input,2), size(input,1), 1))
+    #println(size(input))
+    #println(l.dec_lstm.c)
+    dec_lstm2 = RNN(2*200, 200; dropout=0, rnnType=:lstm)
+    decdec =  dec_lstm2(KnetArray{Float32}(randn(Float32,400,20,1)))
+    decoder_output = l.dec_lstm(input)
+    #attention_vector = l.attention(decoder_output, mem)
+    #return attention_vector
+    return l.dec_lstm.c, l.dec_lstm.h
+end
+
+
+function attention_decode(l::L2L, src_encoded, decoder_output)
+    #println("BURAAA")
+    mem = l.memory(src_encoded)
+    
+    attention_vector = l.attention(decoder_output, mem)
+    projected = l.projection(attention_vector)
+    return projected
+end
+
+
+function eval_training(opt, optim_state, train_loader,l::L2L, using_gpu, word_manager, form_manager)
+    #encoder_optimizer.zero_grad()
+    #decoder_optimizer.zero_grad()
+    #attention_decoder_optimizer.zero_grad()
+    enc_batch, enc_len_batch, dec_tree_batch = random_batch(train_loader)
+    enc_max_len =  size(enc_batch[1],2)
+    #enc_max_len =  size(enc_batch,2)
+    #println("SIZEOFF")
+    println(enc_batch)
+    #println(sizeof(enc_batch))
+
+    #println("RNN_SIZE")
+    #println(opt["rnn_size"])
+    #enc_outputs = zeros((enc_batch.size(0), enc_max_len, encoder.hidden_size), requires_grad=True)
+    #enc_outputs = param(size(enc_batch[1],1), enc_max_len, opt["rnn_size"]; init=zeros)
+ #   println(size(enc_batch[1],1))
+ #   println(size(enc_batch,1))
+  #  println(enc_max_len)
+  #  println(size(enc_batch[1],2))
+    enc_outputs = param(size(enc_batch[1],1), enc_max_len, opt["rnn_size"]; init=zeros)
+    #param((size(enc_batch,1), enc_max_len, opt["rnn_size"]); init=zeros)
+    #if using_gpu: 
+    #    enc_outputs = enc_outputs.cuda()
+    #enc_s = {}
+    enc_s = Dict()
+    for j in range(0,stop=opt["enc_seq_length"] )
+        enc_s[j] = Dict()
+    end
+
+    dec_s = Dict()
+    for i in range(0,stop=opt["dec_seq_length"] )
+        dec_s[i] = Dict()
+        for j in range(0,stop=opt["dec_seq_length"])
+            dec_s[i][j] = Dict()
+	end
+    end
+
+    for i in range(1, stop=2)
+        #param a dimension belirtirken, dimensionlar knette farklı olabilir BAK
+        enc_s[0][i] = param( opt["rnn_size"], opt["batch_size"]; init=zeros)
+
+    end
+
+    for i in range(1, stop=enc_max_len )
+        enc_s[i][1], enc_s[i][2] = encode(l, enc_batch[1][:,i], enc_s[i-1][1], enc_s[i-1][2])
+	#enc_s[i][1], enc_s[i][2] = encode(l, enc_batch[:,i], enc_s[i-1][1], enc_s[i-1][2])
+        enc_outputs[:, i, :] = enc_s[i][2]
+    end
+            
+    # tree decode
+    queue_tree = Dict()
+    for i in range(1, stop=opt["batch_size"])
+        queue_tree[i] = []
+#	println(queue_tree)
+#	println(queue_tree[i])
+#	println("DECTREE_QUEUETREEE")
+#	println(dec_tree_batch)
+        push!(queue_tree[i],Dict("tree"=>dec_tree_batch[i], "parent"=>0, "child_index"=>1))
+	#push!(queu[i] for x in queue_tree],Dict("tree"=>dec_tree_batch[i], "parent"=>0, "child_index"=>1))
+    end
+    loss = 0
+    cur_index, max_index = 1,1
+    dec_batch = Dict()
+    while (cur_index <= max_index)
+        # build dec_batch for cur_index
+        max_w_len = -1
+        batch_w_list = []
+        for i in range(1, stop=opt["batch_size"])
+            w_list = []
+            #if (cur_index <= size(queue_tree[i],1))
+	    if (cur_index <= length(queue_tree[i]))
+                t = queue_tree[i][cur_index ]["tree"]
+		println("TTTTTTTTTTTTTTTTTTTTTT")
+		println(t)
+		println(queue_tree[i])
+                for ic in range(1, stop=t.num_children)
+                    
+                    if t.children[ic] isa Tree
+			
+                        push!(w_list, 4)
+                        push!(queue_tree[i], Dict("tree"=>t.children[ic], "parent"=>cur_index, "child_index"=>ic))
+                    else
+			println("ISAAAAAATREEEEEEEEE")
+                        push!(w_list, t.children[ic])
+                    end
+		end
+                if length(queue_tree[i]) > max_index
+		    #println("MAX_INDEX")
+		    #println(size(queue_tree[i],1))
+                    max_index = length(queue_tree[i])
+                end
+            end
+            if length(w_list) > max_w_len
+                max_w_len = length(w_list)
+            end
+            push!(batch_w_list, w_list)
+        end
+        #dec_batch[cur_index] = torch.zeros((opt.batch_size, max_w_len + 2), dtype=torch.long)
+        #dec_batch[cur_index] = param(opt["batch_size"], max_w_len + 2; init=zeros)
+	dec_batch[cur_index] = Int64.(zeros(opt["batch_size"], max_w_len + 2))
+	#dec_batch[cur_index] = param0(opt["batch_size"], max_w_len + 2)
+        for i in range(1, stop=opt["batch_size"])
+            w_list = batch_w_list[i]
+            if length(w_list) > 0
+                for j in range(1, stop=length(w_list))
+		    println("WLISTWWWWWWWWWWWWWWWWWWW") 
+                    dec_batch[cur_index][i,j+1] = w_list[j]
+                end
+                # add <S>, <E>
+                if cur_index == 1
+                    dec_batch[cur_index][i,1] = 1
+                else
+                    dec_batch[cur_index][i,1] = get_symbol_idx(form_manager, "(")
+                end    
+                dec_batch[cur_index][i,length(w_list) + 2] = 2
+            end
+        end
+
+        for j in range(1, stop=2)
+            #dec_s[cur_index][0][j] = torch.zeros((opt.batch_size, opt.rnn_size), dtype=torch.float, requires_grad=True)
+            #dec_s[cur_index][0][j] = param( opt["rnn_size"], opt["batch_size"] ; init=zeros)
+	    #dec_s[cur_index][0][j] = param(opt["batch_size"], opt["rnn_size"] ; init=zeros)
+	    dec_s[cur_index][0][j] = zeros(Float32, opt["batch_size"], opt["rnn_size"])
+            #if using_gpu
+                #dec_s[cur_index][0][j] = dec_s[cur_index][0][j].cuda()
+            #    dec_s[cur_index][0][j] = (dec_s[cur_index][0][j])
+            #end
+        end
+
+        if cur_index == 1
+            for i in range(1, stop=opt["batch_size"])
+#		println("2802800280280280282000")
+		#println(enc_s)
+		println(22222222222222222)
+		println(enc_s[enc_len_batch[i]][1][i, :])
+		println(dec_s[1][0][1][:, i])
+                dec_s[1][0][1][:, i] .= enc_s[enc_len_batch[i]][1][i, :]
+                dec_s[1][0][2][:, i] .= enc_s[enc_len_batch[i]][2][i, :]
+		println(dec_s[1][0][1][:, i])
+            end
+        
+        else
+            for i in range(1, stop=opt["batch_size"])
+                if (cur_index <= length(queue_tree[i]))
+                    par_index = queue_tree[i][cur_index ]["parent"]
+                    child_index = queue_tree[i][cur_index ]["child_index"]
+                    dec_s[cur_index][0][1][i-1,:] = dec_s[par_index][child_index][1][i-1,:]
+                    dec_s[cur_index][0][2][i-1,:] = dec_s[par_index][child_index][2][i-1,:]
+                end
+            end
+        end
+        gold_string = " "
+        parent_h = dec_s[cur_index][0][2]
+        for i in range(1, stop=size(dec_batch[cur_index], 2) - 1)
+	#for i in range(1, stop=sizeof(dec_batch[cur_index]) - 1)
+	    println("ALOOOOOOOOOOOOOOOOOOOOOOOOO") 
+            dec_s[cur_index][i][1], dec_s[cur_index][i][2] = decode(l, dec_batch[cur_index][:,i],  parent_h)
+            
+	    pred = attention_decode(l, enc_outputs, dec_s[cur_index][i][2])
+#	    println("LOSSSSSS")
+#	    println(nll(pred, dec_batch[cur_index][:,i+1]; dims=1, average=false))
+#           println(nll(pred, dec_batch[cur_index][:,i+1]; dims=1, average=true))
+	    loss += nll(pred, dec_batch[cur_index][:,i+1]; dims=1, average=true)
+            
+        end
+        cur_index = cur_index + 1
+    end
+
+    loss = loss / opt["batch_size"]
+    rmsprop(l, ncycle(train_loader,1); lr=optim_state["learningRate"], rho=optim_state["alpha"])
+    return loss
+end       
+
+
+function main(opt)
+    Random.seed!(opt["seed"])
+    @load  (string(opt["data_dir"]) * "/map.jld2") managers
+    #------------
+    word_manager, form_manager = managers
+    using_gpu = false
+
+
+    #L2L(src_input_size, tgt_input_size, opt, output_size)
+    model = L2L(word_manager.vocab_size, form_manager.vocab_size, opt)
+
+    ##-- load data
+    train_loader = MinibatchLoader(opt, "train", true)
+    if !isdir(opt["checkpoint_dir"])
+        mkdir(opt["checkpoint_dir"])
+    end
+
+    ##-- start training
+    step = 0
+    epoch = 0
+    optim_state = Dict("learningRate" => opt["learning_rate"], "alpha" =>  opt["decay_rate"])
+    # default to rmsprop
+
+    bestloss, bestmodel = eval_training(opt, optim_state, train_loader,model,using_gpu, word_manager, form_manager), deepcopy(model)
+    #if opt["opt_method"] == 0
+    #progress!(adam(model, traindata), seconds=seconds) do y
+    #progress!(rmsprop(model, traindata; lr=optim_state["learningRate"], rho=optim_state["alpha"]), seconds=seconds) do y
+    #progress!(rmsprop(model, train_loader; lr=optim_state["learningRate"], rho=optim_state["alpha"] ) ) do y
+    #    #devloss = loss(model, cdev)
+    #    devloss = eval_training(opt, train_loader,model,using_gpu, word_manager, form_manager)
+    #    if devloss < bestloss
+    #        bestloss, bestmodel = devloss, deepcopy(model)
+    #    end
+    #    #println(stderr)
+    #    (dev=devloss, tst=tstloss, mem=Float32(CUDA.usage[]))
+    #end
+    
+    iterations = opt["max_epochs"] * train_loader.num_batch
+    
+    println("ITERATIONSSSSSS")
+    println(opt["max_epochs"])
+    println(train_loader.num_batch)
+    println(iterations)
+    #start_time = time.time()
+    restarted = false
+    # TODO revert back after tests
+    #iterations = 2
+    for i in range(1,stop=iterations)
+        println("INSIDE LOOOPPPPPPPP")
+        println(i)
+	#epoch = i // train_loader.num_batch
+        epoch = fld(i,train_loader.num_batch)
+        #train_loss = eval_training(opt, train_loader, encoder, decoder, attention_decoder, encoder_optimizer, decoder_optimizer, attention_decoder_optimizer, criterion, using_gpu, word_manager, form_manager)
+        train_loss = eval_training(opt, optim_state, train_loader,model,using_gpu, word_manager, form_manager)
+        
+        #progress!(rmsprop(model, train_loader; lr=optim_state["learningRate"], rho=optim_state["alpha"]), seconds=seconds) do y
+            #devloss = loss(model, cdev)
+            #devloss = eval_training(opt, train_loader,model,using_gpu, word_manager, form_manager)
+            #if devloss < bestloss
+            #    bestloss, bestmodel = devloss, deepcopy(model)
+            #end
+        #end
+        #exponential learning rate decay
+        if opt["opt_method"] == 0
+            if (mod(i , train_loader.num_batch) == 0) & (opt["learning_rate_decay"] < 1)
+                if epoch >= opt["learning_rate_decay_after"]
+                    decay_factor = opt["learning_rate_decay"]
+                    optim_state["learningRate"] = optim_state["learningRate"] * decay_factor #decay it
+
+                end
+            end
+        end
+        if (epoch == opt["restart"]) &  !restarted
+            restarted = True
+            optim_state["learningRate"] = opt["learning_rate"]
+
+        end
+
+
+        #on last iteration
+        if i == iterations 
+            checkpoint = Dict()
+
+            checkpoint["lang2logic_model"] = model
+            checkpoint["opt"] = opt
+            checkpoint["i"] = i
+            checkpoint["epoch"] = epoch
+
+            Knet.save(opt["checkpoint_dir"] *"/model_seq2seq.jld2", "checkpoint", checkpoint)
+        end
+        if train_loss != train_loss
+            print("loss is NaN.  This usually indicates a bug.")
+            break
+        end
+    end
+    Knet.save("attn-$(Int(time_ns())).jld2", "model", bestmodel)
+    #bleu && Main.bleu(bestmodel,dev)
+end
+
+
+start = time()
+s = ArgParseSettings()
+@add_arg_table s begin
+    "--gpuid"
+        arg_type = Int
+        help = "which gpu to use. -1 = use CPU"
+        default = 0
+    "--data_dir"
+        help = "data path"
+        arg_type = String
+        default = "../data/"
+    "--seed"
+        help = "torch manual random number generator seed"
+        arg_type = Int
+        default = 123
+    "--checkpoint_dir"
+        help = "filename to autosave the checkpont to. Will be inside checkpoint_dir/"
+        arg_type = String
+        default = "checkpoint_dir"
+    "--savefile"
+        help = "max vocab size"
+        arg_type = String
+        default = "save"
+    "--print_every"
+        help = "how many steps/minibatches between printing out the loss"
+        arg_type = Int
+        default = 2000
+    "--rnn_size"
+        help = "size of LSTM internal state"
+        arg_type = Int
+        default = 200
+    "--num_layers"
+        help = "number of layers in the LSTM"
+        arg_type = Int
+        default = 1
+    "--dropout"
+        help = "dropout for regularization, used after each RNN hidden layer. 0 = no dropout"
+        arg_type = Float64
+        default = 0.3
+    "--dropoutrec"
+        help = "dropout for regularization, used after each c_i. 0 = no dropout"
+        arg_type = Float64
+        default = 0.3
+    "--enc_seq_length"
+        help = "number of timesteps to unroll for"
+        arg_type = Int
+        default = 60
+    "--dec_seq_length"
+        help = "number of timesteps to unroll for"
+        arg_type = Int
+        default = 220
+    "--batch_size"
+        help = "number of sequences to train on in parallel"
+        arg_type = Int
+        default = 20
+    "--max_epochs"
+        help = "number of full passes through the training data"
+        arg_type = Int
+        default = 130
+    "--opt_method"
+        help = "optimization method: 0-rmsprop 1-sgd"
+        arg_type = Int
+        default = 0
+    "--learning_rate"
+        help = "learning rate"
+        arg_type = Float64
+        default = 0.007
+    "--init_weight"
+        help = "initailization weight"
+        arg_type = Float64
+        default = 0.08
+    "--learning_rate_decay"
+        help = "learning rate decay"
+        arg_type = Float64
+        default = 0.98
+    "--learning_rate_decay_after"
+        help = "in number of epochs, when to start decaying the learning rate"
+        arg_type = Int
+        default = 5
+    "--restart"
+        help = "in number of epochs, when to restart the optimization"
+        arg_type = Int
+        default = -1
+    "--decay_rate"
+        help = "decay rate for rmsprop"
+        arg_type = Float64
+        default = 0.95
+    "--grad_clip"
+        help = "clip gradients at this value"
+        arg_type = Int
+        default = 5
+end
+
+
+args = parse_args(s)
+main(args)
+#endtime = time()
+#time_passed = (endtime - start) / 60
+#print("total time: "* string(time_passed) * "minutes")
